@@ -1,77 +1,57 @@
 #include "nat_engine.h"
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_idf_version.h"
 
-// lwIP includes
+// lwIP includes for NAPT
 extern "C" {
-#include "lwip/netif.h"
-#include "lwip/ip4.h"
+#include "lwip/lwip_napt.h"
+#include "lwip/tcpip.h"  // For LOCK_TCPIP_CORE
 }
 
 NATEngine natEngine;
 PacketCallback NATEngine::packetCallback = nullptr;
 
-// Promiscuous mode callback for packet sniffing
+// Promiscuous mode callback for packet sniffing - kept minimal for throughput
 static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_DATA || !NATEngine::packetCallback) {
         return;
     }
 
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-    wifi_pkt_rx_ctrl_t& ctrl = pkt->rx_ctrl;
+    uint16_t sig_len = pkt->rx_ctrl.sig_len;
 
-    // Only process data frames with sufficient length
-    if (ctrl.sig_len < 24) {  // Minimum 802.11 header
-        return;
-    }
-
-    // 802.11 frame header structure:
-    // Bytes 0-1: Frame control
-    // Bytes 2-3: Duration
-    // Bytes 4-9: Address 1 (destination/receiver)
-    // Bytes 10-15: Address 2 (source/transmitter)
-    // Bytes 16-21: Address 3 (BSSID or other)
-    // Bytes 22-23: Sequence control
+    if (sig_len < 24) return;  // Minimum 802.11 header
 
     const uint8_t* frame = pkt->payload;
     uint16_t frameCtrl = frame[0] | (frame[1] << 8);
 
-    // Check if it's a data frame (Type = 2)
-    uint8_t frameType = (frameCtrl >> 2) & 0x03;
-    if (frameType != 2) {
-        return;
-    }
+    // Data frames only (Type = 2)
+    if (((frameCtrl >> 2) & 0x03) != 2) return;
 
     // Extract To DS and From DS bits
     bool toDS = (frameCtrl >> 8) & 0x01;
     bool fromDS = (frameCtrl >> 9) & 0x01;
 
-    const uint8_t* srcMac = nullptr;
-    const uint8_t* dstMac = nullptr;
-    bool isUpload = false;
-
-    // Determine source/destination based on DS bits
-    // For AP mode:
-    // ToDS=1, FromDS=0: Client to AP (upload from client perspective)
-    // ToDS=0, FromDS=1: AP to client (download from client perspective)
+    const uint8_t* srcMac;
+    const uint8_t* dstMac;
+    bool isUpload;
 
     if (toDS && !fromDS) {
-        // To AP (upload)
-        dstMac = &frame[4];   // Address 1 = BSSID
-        srcMac = &frame[10];  // Address 2 = Source
+        // Client -> AP (upload)
+        dstMac = &frame[4];
+        srcMac = &frame[10];
         isUpload = true;
     } else if (!toDS && fromDS) {
-        // From AP (download)
-        dstMac = &frame[4];   // Address 1 = Destination
-        srcMac = &frame[10];  // Address 2 = BSSID
+        // AP -> Client (download)
+        dstMac = &frame[4];
+        srcMac = &frame[10];
         isUpload = false;
     } else {
-        return;  // Skip other frame types
+        return;
     }
 
-    // Calculate payload length (excluding 802.11 overhead)
-    uint16_t payloadLen = ctrl.sig_len > 36 ? ctrl.sig_len - 36 : 0;
-
+    uint16_t payloadLen = sig_len > 36 ? sig_len - 36 : 0;
     NATEngine::packetCallback(srcMac, dstMac, payloadLen, isUpload);
 }
 
@@ -80,14 +60,15 @@ NATEngine::NATEngine() : enabled(false) {}
 bool NATEngine::begin() {
     DEBUG_PRINTLN("NAT: Initializing...");
 
-    // Enable NAT using WiFi library method (ESP32 Arduino Core 3.x)
-    // The WiFi.enableNAPT() or similar might be available
-    // For now, we rely on the default routing behavior
+    // Enable NAPT for internet forwarding
+    // Must lock TCPIP core when calling lwIP functions in ESP-IDF 5.x
+    IPAddress apIP = WiFi.softAPIP();
 
-    // In ESP32 AP+STA mode, basic routing works automatically
-    // For full NAPT, you may need to enable it in sdkconfig or use esp-idf directly
-    DEBUG_PRINTLN("NAT: Using default AP+STA routing");
-    DEBUG_PRINTLN("NAT: Note: For full internet access, NAPT may need sdkconfig changes");
+    LOCK_TCPIP_CORE();
+    ip_napt_enable((u32_t)apIP, 1);
+    UNLOCK_TCPIP_CORE();
+
+    DEBUG_PRINTF("NAT: NAPT enabled on %s\n", apIP.toString().c_str());
 
     // Enable promiscuous mode for packet counting
     // This works independently of NAPT

@@ -1,5 +1,6 @@
 #include "device_manager.h"
 #include "storage_manager.h"
+#include "oui_lookup.h"
 
 DeviceManager deviceManager;
 
@@ -48,6 +49,22 @@ DeviceInfo* DeviceManager::findOrCreateDevice(const uint8_t* mac) {
         strncpy(newDevice.customName, savedName.c_str(), MAX_DEVICE_NAME - 1);
         newDevice.customName[MAX_DEVICE_NAME - 1] = '\0';
         newDevice.hasCustomName = true;
+    } else {
+        // Check if MAC is locally administered (randomized/private)
+        // Bit 1 of first octet = 1 means locally administered
+        bool isRandomized = (mac[0] & 0x02) != 0;
+
+        if (isRandomized) {
+            strncpy(newDevice.autoName, "Private Device", MAX_DEVICE_NAME - 1);
+            newDevice.autoName[MAX_DEVICE_NAME - 1] = '\0';
+        } else {
+            // Try OUI vendor lookup for real MAC addresses
+            String vendor = ouiLookup.lookupVendor(mac);
+            if (vendor.length() > 0) {
+                strncpy(newDevice.autoName, vendor.c_str(), MAX_DEVICE_NAME - 1);
+                newDevice.autoName[MAX_DEVICE_NAME - 1] = '\0';
+            }
+        }
     }
 
     devices.push_back(newDevice);

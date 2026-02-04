@@ -17,7 +17,13 @@ DNSBlockingServer::DNSBlockingServer() :
     upstreamDNS(DEFAULT_UPSTREAM_DNS),
     queryCount(0),
     blockedCount(0),
-    running(false) {}
+    cacheHits(0),
+    running(false),
+    _requestQueue(NULL),
+    _responseQueue(NULL),
+    _forwardTask(NULL) {
+    memset(_cache, 0, sizeof(_cache));
+}
 
 bool DNSBlockingServer::begin() {
     // Load upstream DNS from storage
@@ -32,26 +38,89 @@ bool DNSBlockingServer::begin() {
         return false;
     }
 
+    // Create forwarding queues
+    _requestQueue = xQueueCreate(DNS_FORWARD_QUEUE_SIZE, sizeof(DNSForwardRequest));
+    _responseQueue = xQueueCreate(DNS_FORWARD_QUEUE_SIZE, sizeof(DNSForwardResponse));
+
+    if (!_requestQueue || !_responseQueue) {
+        DEBUG_PRINTLN("DNS: Failed to create forwarding queues");
+        udp.stop();
+        return false;
+    }
+
+    // Create forwarding task on core 0
+    BaseType_t result = xTaskCreatePinnedToCore(
+        forwardTaskFunc,
+        "dns_fwd",
+        DNS_TASK_STACK_SIZE,
+        this,
+        DNS_TASK_PRIORITY,
+        &_forwardTask,
+        0  // Core 0 (keeps main loop on core 1 free)
+    );
+
+    if (result != pdPASS) {
+        DEBUG_PRINTLN("DNS: Failed to create forwarding task");
+        udp.stop();
+        vQueueDelete(_requestQueue);
+        vQueueDelete(_responseQueue);
+        return false;
+    }
+
     running = true;
     DEBUG_PRINTF("DNS: Server started on port %d, upstream: %s\n",
                  DNS_PORT, upstreamDNS.toString().c_str());
     DEBUG_PRINTF("DNS: %d blocked domains loaded\n", blockedDomains.size());
+    DEBUG_PRINTF("DNS: Async forwarding enabled (cache: %d entries, TTL: %ds)\n",
+                 DNS_CACHE_SIZE, DNS_CACHE_TTL_MS / 1000);
 
     return true;
 }
 
 void DNSBlockingServer::stop() {
-    udp.stop();
     running = false;
+
+    if (_forwardTask) {
+        vTaskDelete(_forwardTask);
+        _forwardTask = NULL;
+    }
+    if (_requestQueue) {
+        vQueueDelete(_requestQueue);
+        _requestQueue = NULL;
+    }
+    if (_responseQueue) {
+        vQueueDelete(_responseQueue);
+        _responseQueue = NULL;
+    }
+
+    udp.stop();
     DEBUG_PRINTLN("DNS: Server stopped");
 }
 
 void DNSBlockingServer::processRequests() {
     if (!running) return;
 
+    // First, send any completed forward responses back to clients
+    drainResponseQueue();
+
+    // Then check for new incoming DNS queries
     int packetSize = udp.parsePacket();
     if (packetSize > 0) {
         handleDNSRequest();
+    }
+}
+
+void DNSBlockingServer::drainResponseQueue() {
+    DNSForwardResponse resp;
+    while (xQueueReceive(_responseQueue, &resp, 0) == pdTRUE) {
+        // Cache the response for future lookups
+        cacheStore(resp.domain, resp.packet, resp.packetLen);
+
+        // Send response to original client via port 53
+        IPAddress clientIP(resp.clientIP);
+        udp.beginPacket(clientIP, resp.clientPort);
+        udp.write(resp.packet, resp.packetLen);
+        udp.endPacket();
     }
 }
 
@@ -94,9 +163,29 @@ void DNSBlockingServer::handleDNSRequest() {
         DEBUG_PRINTF("DNS: BLOCKED '%s'\n", domain.c_str());
         blockedCount++;
         sendBlockedResponse(buffer, len, udp.remoteIP(), udp.remotePort());
-    } else {
-        forwardRequest(buffer, len, udp.remoteIP(), udp.remotePort());
+        return;
     }
+
+    // Check cache before forwarding upstream
+    DNSCacheEntry* cached = cacheLookup(domain.c_str());
+    if (cached) {
+        DEBUG_PRINTF("DNS: Cache hit for '%s'\n", domain.c_str());
+        cacheHits++;
+
+        // Send cached response with updated transaction ID
+        uint8_t response[512];
+        memcpy(response, cached->response, cached->responseLen);
+        response[0] = buffer[0];  // Copy transaction ID from query
+        response[1] = buffer[1];
+
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.write(response, cached->responseLen);
+        udp.endPacket();
+        return;
+    }
+
+    // Queue for async forwarding (non-blocking)
+    queueForwardRequest(buffer, len, udp.remoteIP(), udp.remotePort(), domain);
 }
 
 bool DNSBlockingServer::parseDomainName(const uint8_t* buffer, int bufferLen, int& offset, String& domain) {
@@ -168,35 +257,132 @@ void DNSBlockingServer::sendBlockedResponse(const uint8_t* request, int requestL
     udp.endPacket();
 }
 
-void DNSBlockingServer::forwardRequest(const uint8_t* request, int requestLen, IPAddress client, uint16_t clientPort) {
+void DNSBlockingServer::queueForwardRequest(const uint8_t* request, int requestLen, IPAddress client, uint16_t clientPort, const String& domain) {
+    DNSForwardRequest req;
+    memcpy(req.packet, request, requestLen);
+    req.packetLen = requestLen;
+    req.clientIP = (uint32_t)client;
+    req.clientPort = clientPort;
+    strncpy(req.domain, domain.c_str(), MAX_DOMAIN_LENGTH);
+    req.domain[MAX_DOMAIN_LENGTH] = '\0';
+
+    if (xQueueSend(_requestQueue, &req, 0) != pdTRUE) {
+        DEBUG_PRINTLN("DNS: Forward queue full, dropping request");
+    }
+}
+
+// Runs on core 0 as a separate FreeRTOS task
+void DNSBlockingServer::forwardTaskFunc(void* param) {
+    DNSBlockingServer* self = (DNSBlockingServer*)param;
+    DNSForwardRequest req;
     WiFiUDP forwardUdp;
-    uint8_t response[512];
+    forwardUdp.begin(0);  // Bind once, reuse for all queries
 
-    // Forward to upstream DNS
-    forwardUdp.begin(0);  // Random local port
-    forwardUdp.beginPacket(upstreamDNS, 53);
-    forwardUdp.write(request, requestLen);
-    forwardUdp.endPacket();
-
-    // Wait for response
-    unsigned long start = millis();
-    while (millis() - start < DNS_TIMEOUT_MS) {
-        int packetSize = forwardUdp.parsePacket();
-        if (packetSize > 0) {
-            int len = forwardUdp.read(response, sizeof(response));
-            forwardUdp.stop();
-
-            // Forward response to original client
-            udp.beginPacket(client, clientPort);
-            udp.write(response, len);
-            udp.endPacket();
-            return;
+    for (;;) {
+        // Block until a forward request is available
+        if (xQueueReceive(self->_requestQueue, &req, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
-        delay(1);
+
+        // Flush any stale responses from previous timed-out queries
+        uint8_t discard[512];
+        while (forwardUdp.parsePacket() > 0) {
+            forwardUdp.read(discard, sizeof(discard));
+        }
+
+        // Forward to upstream DNS
+        forwardUdp.beginPacket(self->upstreamDNS, 53);
+        forwardUdp.write(req.packet, req.packetLen);
+        forwardUdp.endPacket();
+
+        // Extract transaction ID for response matching
+        uint16_t queryId = (req.packet[0] << 8) | req.packet[1];
+
+        // Wait for response with reduced timeout
+        bool gotResponse = false;
+        unsigned long start = millis();
+        while (millis() - start < DNS_TIMEOUT_MS) {
+            int packetSize = forwardUdp.parsePacket();
+            if (packetSize > 0) {
+                uint8_t response[512];
+                int len = forwardUdp.read(response, sizeof(response));
+
+                // Verify transaction ID matches our query
+                if (len >= 2) {
+                    uint16_t respId = (response[0] << 8) | response[1];
+                    if (respId == queryId) {
+                        // Queue response for main loop to send via port 53
+                        DNSForwardResponse resp;
+                        memcpy(resp.packet, response, len);
+                        resp.packetLen = len;
+                        resp.clientIP = req.clientIP;
+                        resp.clientPort = req.clientPort;
+                        strncpy(resp.domain, req.domain, MAX_DOMAIN_LENGTH);
+                        resp.domain[MAX_DOMAIN_LENGTH] = '\0';
+
+                        xQueueSend(self->_responseQueue, &resp, pdMS_TO_TICKS(100));
+                        gotResponse = true;
+                        break;
+                    }
+                    // Mismatched ID - stale response, discard and keep waiting
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        if (!gotResponse) {
+            DEBUG_PRINTF("DNS: Upstream timeout for '%s'\n", req.domain);
+        }
+    }
+}
+
+// Cache lookup - returns entry if found and not expired, NULL otherwise
+DNSCacheEntry* DNSBlockingServer::cacheLookup(const char* domain) {
+    uint32_t now = millis();
+    for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+        if (_cache[i].valid &&
+            strcasecmp(_cache[i].domain, domain) == 0 &&
+            (now - _cache[i].timestamp) < DNS_CACHE_TTL_MS) {
+            return &_cache[i];
+        }
+    }
+    return nullptr;
+}
+
+// Cache store - replaces existing entry for same domain, or oldest entry
+void DNSBlockingServer::cacheStore(const char* domain, const uint8_t* response, int responseLen) {
+    int slot = -1;
+    uint32_t oldestTime = UINT32_MAX;
+    int oldestSlot = 0;
+
+    for (int i = 0; i < DNS_CACHE_SIZE; i++) {
+        // Prefer empty slot
+        if (!_cache[i].valid) {
+            slot = i;
+            break;
+        }
+        // Update existing entry for same domain
+        if (strcasecmp(_cache[i].domain, domain) == 0) {
+            slot = i;
+            break;
+        }
+        // Track oldest for eviction
+        if (_cache[i].timestamp < oldestTime) {
+            oldestTime = _cache[i].timestamp;
+            oldestSlot = i;
+        }
     }
 
-    forwardUdp.stop();
-    DEBUG_PRINTLN("DNS: Upstream timeout");
+    if (slot < 0) {
+        slot = oldestSlot;  // Evict oldest
+    }
+
+    strncpy(_cache[slot].domain, domain, MAX_DOMAIN_LENGTH);
+    _cache[slot].domain[MAX_DOMAIN_LENGTH] = '\0';
+    memcpy(_cache[slot].response, response, responseLen);
+    _cache[slot].responseLen = responseLen;
+    _cache[slot].timestamp = millis();
+    _cache[slot].valid = true;
 }
 
 bool DNSBlockingServer::addBlockedDomain(const String& domain) {
@@ -238,13 +424,18 @@ bool DNSBlockingServer::removeBlockedDomain(const String& domain) {
 bool DNSBlockingServer::isBlocked(const String& domain) {
     String queryDomain = normalizeDomain(domain);
 
+    // Take mutex briefly - blockedDomains can be modified by web handlers on the async task
+    bool result = false;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     for (const auto& blocked : blockedDomains) {
         if (domainMatches(queryDomain, blocked)) {
-            return true;
+            result = true;
+            break;
         }
     }
+    xSemaphoreGive(dataMutex);
 
-    return false;
+    return result;
 }
 
 bool DNSBlockingServer::domainMatches(const String& queryDomain, const String& blockedDomain) {
@@ -306,4 +497,8 @@ uint32_t DNSBlockingServer::getQueryCount() {
 
 uint32_t DNSBlockingServer::getBlockedCount() {
     return blockedCount;
+}
+
+uint32_t DNSBlockingServer::getCacheHits() {
+    return cacheHits;
 }

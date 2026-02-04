@@ -90,8 +90,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 <span id="routerStatus" class="status-offline">Disconnected</span>
             </div>
             <div class="status-item">
-                <label>Router IP</label>
+                <label>Dashboard from Main WiFi</label>
                 <span id="staIP">-</span>
+                <span id="mdnsLink" style="display:block;font-size:0.85rem;color:#888;"></span>
             </div>
             <div class="status-item">
                 <label>Connected Devices</label>
@@ -104,6 +105,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <div class="status-item">
                 <label>Free Memory</label>
                 <span id="freeHeap">-</span>
+                <span id="minFreeHeap" style="display:block;font-size:0.75rem;color:#888;"></span>
+            </div>
+            <div class="status-item">
+                <label>CPU Load</label>
+                <span id="cpuLoad">-</span>
+                <span id="loopFreq" style="display:block;font-size:0.75rem;color:#888;"></span>
             </div>
         </div>
 
@@ -243,9 +250,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         function updateStatus(status) {
             document.getElementById('routerStatus').textContent = status.connected ? 'Connected' : 'Disconnected';
             document.getElementById('routerStatus').className = status.connected ? 'status-online' : 'status-offline';
-            document.getElementById('staIP').textContent = status.staIP || '-';
+            const staIPEl = document.getElementById('staIP');
+            const mdnsEl = document.getElementById('mdnsLink');
+            if (status.staIP && status.connected) {
+                staIPEl.innerHTML = '<a href="http://' + status.staIP + '" style="color:#00d4ff;">' + status.staIP + '</a>';
+                if (status.mdnsHost) {
+                    mdnsEl.innerHTML = '<a href="http://' + status.mdnsHost + '.local" style="color:#00d4ff;">' + status.mdnsHost + '.local</a>';
+                }
+            } else {
+                staIPEl.textContent = '-';
+                mdnsEl.textContent = '';
+            }
             document.getElementById('uptime').textContent = formatUptime(status.uptime);
             document.getElementById('freeHeap').textContent = formatBytes(status.freeHeap);
+            if (status.minFreeHeap) {
+                document.getElementById('minFreeHeap').textContent = 'Min: ' + formatBytes(status.minFreeHeap);
+            }
+            if (status.loopFreq !== undefined) {
+                const freq = status.loopFreq;
+                const el = document.getElementById('cpuLoad');
+                const freqEl = document.getElementById('loopFreq');
+                // Estimate load: with 1ms delay, max ~1000 loops/sec when idle
+                const maxLoops = 1000;
+                const load = Math.max(0, Math.min(100, Math.round((1 - freq / maxLoops) * 100)));
+                el.textContent = load + '%';
+                el.style.color = load < 50 ? '#00ff88' : load < 80 ? '#ffaa00' : '#ff4444';
+                freqEl.textContent = freq + ' loops/s @ ' + (status.cpuFreq || 240) + 'MHz';
+            }
             document.getElementById('dnsQueries').textContent = status.dnsQueries || 0;
             document.getElementById('dnsBlocked').textContent = status.dnsBlocked || 0;
             document.getElementById('dnsInput').placeholder = status.upstreamDNS || '1.1.1.1';

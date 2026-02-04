@@ -10,8 +10,11 @@ A complete home network monitoring and control system built on ESP32 that tracks
 
 - **Per-Device Bandwidth Tracking** - Monitor upload/download usage for each connected device
 - **DNS-Based Domain Blocking** - Block unwanted domains (ads, social media, etc.)
+- **DNS Response Cache** - Cached lookups for faster repeat visits (16 entries, 60s TTL)
 - **Web Dashboard** - Mobile-friendly interface accessible from any browser
 - **Device Naming** - Assign friendly names to devices (e.g., "iPhone", "Laptop")
+- **Auto Device Discovery** - Automatically detects device names via DHCP hostname
+- **mDNS Support** - Access via `http://networkmonitor.local` from any device
 - **Persistent Storage** - All settings and stats survive reboots
 - **Real-time Updates** - Dashboard auto-refreshes every 5 seconds
 - **No Cloud Required** - Everything runs locally on your network
@@ -140,6 +143,9 @@ Install via `Sketch` → `Include Library` → `Add .ZIP Library`
 #define AP_IP                IPAddress(192, 168, 4, 1)   // Dashboard address
 #define DEFAULT_UPSTREAM_DNS IPAddress(1, 1, 1, 1)       // Cloudflare DNS
 
+// ─── mDNS ───
+#define MDNS_HOSTNAME        "networkmonitor"            // Access via http://networkmonitor.local
+
 // ─── Debug ───
 #define DEBUG_SERIAL         true                  // Enable serial output
 #define SERIAL_BAUD          115200                // Serial baud rate
@@ -157,6 +163,12 @@ Install via `Sketch` → `Include Library` → `Add .ZIP Library`
    - **SSID**: `ESP32_Monitor`
    - **Password**: `monitor123`
 4. **Open browser** and go to: `http://192.168.4.1`
+
+### Access from Main WiFi
+
+You can also access the dashboard from your main WiFi network:
+- **Via mDNS**: `http://networkmonitor.local`
+- **Via IP**: Use the IP shown in Serial Monitor (e.g., `http://192.168.1.105`)
 
 ### Dashboard Features
 
@@ -282,42 +294,61 @@ The system uses **WiFi promiscuous mode** to capture all 802.11 data frames:
    - Source/Destination MAC addresses
    - Frame direction (To-DS/From-DS flags)
    - Payload length
-4. Traffic is attributed to devices by MAC address
-5. Direction determines upload vs download
+4. Events are pushed to a lock-free ring buffer (512 slots)
+5. Main loop drains the buffer and attributes traffic by MAC address
+6. Direction determines upload vs download
 
 **Accuracy**: ±5% (excludes WiFi protocol overhead)
 
 ### DNS Filtering
 
+DNS queries are handled without blocking the main loop:
+
 ```
 Client Request: api.youtube.com
         │
         ▼
-┌─────────────────────┐
-│ ESP32 DNS Server    │
-│                     │
-│ Check blocklist:    │
-│ • api.youtube.com?  │──No──┐
-│ • youtube.com?      │──Yes─┼─→ Return 0.0.0.0
-│ • com?              │──No──┘
-│                     │
-│ Not blocked:        │
-│ Forward to 1.1.1.1  │──────→ Return real IP
-└─────────────────────┘
+┌──────────────────────────┐
+│ ESP32 DNS Server         │
+│                          │
+│ 1. Check blocklist:      │
+│    youtube.com? ─── Yes ─┼──→ Return 0.0.0.0
+│                          │
+│ 2. Check cache:          │
+│    Cached? ──────── Yes ─┼──→ Return cached IP (instant)
+│                          │
+│ 3. Queue for forwarding: │
+│    (non-blocking)        │
+│         │                │
+└─────────┼────────────────┘
+          ▼
+┌──────────────────────────┐
+│ Forwarding Task (Core 0) │
+│                          │
+│ Forward to 1.1.1.1       │
+│ Wait for response (1s)   │
+│ Queue response + cache   │
+└──────────────────────────┘
 ```
+
+DNS forwarding runs on a dedicated FreeRTOS task on core 0, so upstream
+latency never stalls the main loop. Responses are cached (16 entries,
+60-second TTL) so repeat lookups are served instantly.
 
 ### File Structure
 
 ```
-esp32-wifi/
+esp32_network_monitor/
 ├── esp32_network_monitor.ino  # Main sketch entry point
 ├── config.h                    # Configuration constants
 ├── storage_manager.h/cpp       # NVS persistence layer
 ├── wifi_manager.h/cpp          # WiFi AP+STA management
 ├── nat_engine.h/cpp            # NAT routing & packet capture
-├── dns_server.h/cpp            # DNS server with blocking
-├── bandwidth_tracker.h/cpp     # Per-device traffic counting
+├── dns_server.h/cpp            # DNS server with async forwarding & cache
+├── bandwidth_tracker.h/cpp     # Per-device traffic counting (512-slot ring buffer)
 ├── device_manager.h/cpp        # Device naming & tracking
+├── network_scanner.h/cpp       # ARP & mDNS device discovery
+├── oui_lookup.h/cpp            # MAC vendor identification (OUI database)
 ├── web_server.h/cpp            # HTTP server & REST API
 ├── web_content.h               # Embedded HTML/JS/CSS
 └── README.md                   # This file
@@ -329,10 +360,12 @@ esp32-wifi/
 |-----------|-----------|
 | WiFi Stack | ~50 KB |
 | Web Server | ~10 KB |
-| Device Tracking (8 devices) | ~1 KB |
-| DNS Buffers | ~2 KB |
-| Blocked Domains (50) | ~2 KB |
-| **Total** | **~65 KB** |
+| Device Tracking (16 devices) | ~1 KB |
+| DNS Forwarding Queues + Cache | ~19 KB |
+| DNS Forwarding Task Stack | ~8 KB |
+| Bandwidth Ring Buffer (512 slots) | ~6 KB |
+| Blocked Domains (100) | ~4 KB |
+| **Total** | **~98 KB** |
 
 ESP32 has ~320 KB available RAM - plenty of headroom.
 
@@ -367,6 +400,14 @@ ESP32 has ~320 KB available RAM - plenty of headroom.
 2. Try `http://192.168.4.1` directly (not HTTPS)
 3. Disable VPN if active
 4. Check Serial Monitor for web server errors
+
+### mDNS (networkmonitor.local) Not Working
+
+1. **Windows/macOS/iOS**: Should work natively
+2. **Linux**: Install avahi-daemon (`sudo apt install avahi-daemon`)
+3. **Android**: Limited support - use IP address instead
+4. Try using the IP address shown in Serial Monitor
+5. Ensure you're on the same network as the ESP32
 
 ### Compilation Errors
 

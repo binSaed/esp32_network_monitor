@@ -4,15 +4,22 @@
 
 BandwidthTracker bandwidthTracker;
 
-BandwidthTracker::BandwidthTracker() : lastSaveTime(0) {}
+BandwidthTracker::BandwidthTracker() : lastSaveTime(0), _head(0), _tail(0) {
+    memset(_apMac, 0, 6);
+}
 
 void BandwidthTracker::begin() {
+    // Cache AP MAC so recordPacket doesn't need to call WiFi APIs
+    WiFi.softAPmacAddress(_apMac);
     loadStats();
     lastSaveTime = millis();
     DEBUG_PRINTLN("Bandwidth: Tracker initialized");
 }
 
 void BandwidthTracker::update() {
+    // Drain packet queue from WiFi task (must happen before anything else)
+    processPacketQueue();
+
     // Periodic save
     if (millis() - lastSaveTime > STATS_SAVE_INTERVAL_MS) {
         saveStats();
@@ -29,31 +36,44 @@ void BandwidthTracker::update() {
 }
 
 void BandwidthTracker::recordPacket(const uint8_t* srcMac, const uint8_t* dstMac, uint16_t length, bool isUpload) {
-    // Skip if MAC is broadcast or multicast
+    // Called from WiFi task (promiscuous callback) - keep minimal, no allocations
     if (srcMac[0] & 0x01 || dstMac[0] & 0x01) {
         return;
     }
 
-    // Skip if it's the ESP32's own MAC
-    uint8_t apMac[6];
-    WiFi.softAPmacAddress(apMac);
-
     const uint8_t* clientMac = isUpload ? srcMac : dstMac;
 
-    // Skip if the client MAC is actually the AP
-    if (macEqual(clientMac, apMac)) {
+    // Use cached AP MAC instead of calling WiFi.softAPmacAddress()
+    if (macEqual(clientMac, _apMac)) {
         return;
     }
 
-    DeviceStats* stats = findOrCreateDevice(clientMac);
-    if (stats) {
-        if (isUpload) {
-            stats->uploadBytes += length;
-        } else {
-            stats->downloadBytes += length;
+    // Write to ring buffer (lock-free: single producer from WiFi task)
+    int next = (_head + 1) % RING_SIZE;
+    if (next != _tail) {  // Not full
+        memcpy(_ring[_head].mac, clientMac, 6);
+        _ring[_head].length = length;
+        _ring[_head].isUpload = isUpload;
+        _head = next;  // Publish (volatile write makes it visible to consumer)
+    }
+    // If full, drop the packet event (stats will be slightly off, but no crash)
+}
+
+void BandwidthTracker::processPacketQueue() {
+    // Called from main loop only - safe to modify vectors
+    while (_tail != _head) {
+        PacketEvent& evt = _ring[_tail];
+        DeviceStats* stats = findOrCreateDevice(evt.mac);
+        if (stats) {
+            if (evt.isUpload) {
+                stats->uploadBytes += evt.length;
+            } else {
+                stats->downloadBytes += evt.length;
+            }
+            stats->lastSeen = millis();
+            stats->active = true;
         }
-        stats->lastSeen = millis();
-        stats->active = true;
+        _tail = (_tail + 1) % RING_SIZE;
     }
 }
 
@@ -175,9 +195,7 @@ void BandwidthTracker::macCopy(uint8_t* dst, const uint8_t* src) {
 }
 
 bool BandwidthTracker::isLocalMAC(const uint8_t* mac) {
-    uint8_t apMac[6], staMac[6];
-    WiFi.softAPmacAddress(apMac);
+    uint8_t staMac[6];
     WiFi.macAddress(staMac);
-
-    return macEqual(mac, apMac) || macEqual(mac, staMac);
+    return macEqual(mac, _apMac) || macEqual(mac, staMac);
 }

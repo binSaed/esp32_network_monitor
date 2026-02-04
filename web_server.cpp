@@ -120,23 +120,29 @@ void WebDashboard::setupRoutes() {
 }
 
 void WebDashboard::handleGetDevices(AsyncWebServerRequest* request) {
-    std::vector<DeviceStats> stats = bandwidthTracker.getAllStats();
-
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-
-    for (const auto& s : stats) {
-        JsonObject obj = arr.add<JsonObject>();
-        obj["mac"] = deviceManager.macToString(s.mac);
-        obj["name"] = deviceManager.getDeviceName(s.mac);
-        obj["upload"] = s.uploadBytes;
-        obj["download"] = s.downloadBytes;
-        obj["total"] = s.totalBytes();
-        obj["active"] = s.active;
-    }
-
     String response;
-    serializeJson(doc, response);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    {
+        std::vector<DeviceStats> stats = bandwidthTracker.getAllStats();
+
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+
+        for (const auto& s : stats) {
+            JsonObject obj = arr.add<JsonObject>();
+            obj["mac"] = deviceManager.macToString(s.mac);
+            obj["name"] = deviceManager.getDeviceName(s.mac);
+            obj["upload"] = s.uploadBytes;
+            obj["download"] = s.downloadBytes;
+            obj["total"] = s.totalBytes();
+            obj["active"] = s.active;
+        }
+
+        serializeJson(doc, response);
+    }
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", response);
 }
 
@@ -165,7 +171,10 @@ void WebDashboard::handleSetDeviceName(AsyncWebServerRequest* request, uint8_t* 
     }
 
     String name = doc["name"] | "";
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     deviceManager.setDeviceName(mac, name);
+    xSemaphoreGive(dataMutex);
 
     request->send(200, "application/json", "{\"success\":true}");
 }
@@ -186,27 +195,39 @@ void WebDashboard::handleResetDevice(AsyncWebServerRequest* request) {
         return;
     }
 
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     bandwidthTracker.resetDeviceStats(mac);
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", "{\"success\":true}");
 }
 
 void WebDashboard::handleResetAllStats(AsyncWebServerRequest* request) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     bandwidthTracker.resetAllStats();
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", "{\"success\":true}");
 }
 
 void WebDashboard::handleGetBlockedDomains(AsyncWebServerRequest* request) {
-    std::vector<String> domains = dnsServer.getBlockedDomains();
-
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-
-    for (const auto& d : domains) {
-        arr.add(d);
-    }
-
     String response;
-    serializeJson(doc, response);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    {
+        std::vector<String> domains = dnsServer.getBlockedDomains();
+
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+
+        for (const auto& d : domains) {
+            arr.add(d);
+        }
+
+        serializeJson(doc, response);
+    }
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", response);
 }
 
@@ -225,7 +246,11 @@ void WebDashboard::handleBlockDomain(AsyncWebServerRequest* request, uint8_t* da
         return;
     }
 
-    if (dnsServer.addBlockedDomain(domain)) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bool ok = dnsServer.addBlockedDomain(domain);
+    xSemaphoreGive(dataMutex);
+
+    if (ok) {
         request->send(200, "application/json", "{\"success\":true}");
     } else {
         request->send(400, "application/json", "{\"error\":\"Failed to add domain\"}");
@@ -247,7 +272,11 @@ void WebDashboard::handleUnblockDomain(AsyncWebServerRequest* request, uint8_t* 
         return;
     }
 
-    if (dnsServer.removeBlockedDomain(domain)) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bool ok = dnsServer.removeBlockedDomain(domain);
+    xSemaphoreGive(dataMutex);
+
+    if (ok) {
         request->send(200, "application/json", "{\"success\":true}");
     } else {
         request->send(400, "application/json", "{\"error\":\"Domain not found\"}");
@@ -255,33 +284,49 @@ void WebDashboard::handleUnblockDomain(AsyncWebServerRequest* request, uint8_t* 
 }
 
 void WebDashboard::handleGetStatus(AsyncWebServerRequest* request) {
-    JsonDocument doc;
-
-    doc["connected"] = wifiMgr.isConnectedToRouter();
-    doc["staIP"] = wifiMgr.isConnectedToRouter() ? wifiMgr.getSTAIP().toString() : "";
-    doc["apIP"] = wifiMgr.getAPIP().toString();
-    doc["ssid"] = wifiMgr.getSTASSID();
-    doc["clients"] = wifiMgr.getConnectedClients();
-    doc["uptime"] = millis() / 1000;
-    doc["freeHeap"] = ESP.getFreeHeap();
-    doc["upstreamDNS"] = dnsServer.getUpstreamDNS().toString();
-    doc["dnsQueries"] = dnsServer.getQueryCount();
-    doc["dnsBlocked"] = dnsServer.getBlockedCount();
-
     String response;
-    serializeJson(doc, response);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    {
+        JsonDocument doc;
+
+        doc["connected"] = wifiMgr.isConnectedToRouter();
+        doc["staIP"] = wifiMgr.isConnectedToRouter() ? wifiMgr.getSTAIP().toString() : "";
+        doc["apIP"] = wifiMgr.getAPIP().toString();
+        doc["ssid"] = wifiMgr.getSTASSID();
+        doc["clients"] = wifiMgr.getConnectedClients();
+        doc["uptime"] = millis() / 1000;
+        doc["freeHeap"] = ESP.getFreeHeap();
+        doc["minFreeHeap"] = ESP.getMinFreeHeap();
+        doc["cpuFreq"] = ESP.getCpuFreqMHz();
+        doc["loopFreq"] = loopsPerSecond;
+        doc["upstreamDNS"] = dnsServer.getUpstreamDNS().toString();
+        doc["dnsQueries"] = dnsServer.getQueryCount();
+        doc["dnsBlocked"] = dnsServer.getBlockedCount();
+        doc["mdnsHost"] = MDNS_HOSTNAME;
+
+        serializeJson(doc, response);
+    }
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", response);
 }
 
 void WebDashboard::handleGetSettings(AsyncWebServerRequest* request) {
-    JsonDocument doc;
-
-    doc["upstreamDNS"] = dnsServer.getUpstreamDNS().toString();
-    doc["staSSID"] = wifiMgr.getSTASSID();
-    doc["connected"] = wifiMgr.isConnectedToRouter();
-
     String response;
-    serializeJson(doc, response);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    {
+        JsonDocument doc;
+
+        doc["upstreamDNS"] = dnsServer.getUpstreamDNS().toString();
+        doc["staSSID"] = wifiMgr.getSTASSID();
+        doc["connected"] = wifiMgr.isConnectedToRouter();
+
+        serializeJson(doc, response);
+    }
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", response);
 }
 
@@ -306,7 +351,10 @@ void WebDashboard::handleSetDNS(AsyncWebServerRequest* request, uint8_t* data, s
         return;
     }
 
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     dnsServer.setUpstreamDNS(dns);
+    xSemaphoreGive(dataMutex);
+
     request->send(200, "application/json", "{\"success\":true}");
 }
 

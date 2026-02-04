@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 #include "storage_manager.h"
+#include "esp_wifi.h"
 
 WiFiManager wifiMgr;
 WiFiManager* WiFiManager::instance = nullptr;
@@ -50,8 +51,11 @@ bool WiFiManager::startAccessPoint() {
     bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false, AP_MAX_CONNECTIONS);
 
     if (ok) {
+        // Use 40MHz bandwidth for higher throughput
+        esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40);
+
         status = WIFI_STATUS_AP_STARTED;
-        DEBUG_PRINTF("WiFi: AP started at %s\n", WiFi.softAPIP().toString().c_str());
+        DEBUG_PRINTF("WiFi: AP started at %s (HT40)\n", WiFi.softAPIP().toString().c_str());
     } else {
         DEBUG_PRINTLN("WiFi: AP start failed");
     }
@@ -80,7 +84,12 @@ bool WiFiManager::connectToRouter(const String& ssid, const String& password) {
 
     if (WiFi.status() == WL_CONNECTED) {
         status = WIFI_STATUS_CONNECTED;
-        DEBUG_PRINTF("WiFi: Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+        // Use 40MHz bandwidth and disable power save for max throughput
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+
+        DEBUG_PRINTF("WiFi: Connected! IP: %s (HT40, PS off)\n", WiFi.localIP().toString().c_str());
 
         // Save working credentials
         storage.saveSTACredentials(ssid, password);

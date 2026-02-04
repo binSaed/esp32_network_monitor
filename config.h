@@ -23,10 +23,20 @@
 // --- DNS Configuration ---
 #define DNS_PORT             53
 #define DEFAULT_UPSTREAM_DNS IPAddress(1, 1, 1, 1)  // Cloudflare
-#define DNS_TIMEOUT_MS       3000
+#define DNS_TIMEOUT_MS       1000  // Reduced from 3000ms for faster fallback
 
 // --- Web Server ---
 #define WEB_SERVER_PORT      80
+
+// --- mDNS (Local Domain) ---
+#define MDNS_HOSTNAME        "networkmonitor"  // Access via http://networkmonitor.local
+
+// --- DNS Async Forwarding & Cache ---
+#define DNS_CACHE_SIZE         16
+#define DNS_CACHE_TTL_MS       60000   // Cache TTL: 60 seconds
+#define DNS_FORWARD_QUEUE_SIZE 16
+#define DNS_TASK_STACK_SIZE    8192
+#define DNS_TASK_PRIORITY      2
 
 // --- Device Limits ---
 #define MAX_DEVICES          16
@@ -58,5 +68,16 @@
   #define DEBUG_PRINTLN(x)
   #define DEBUG_PRINTF(...)
 #endif
+
+// --- Thread Safety ---
+// Mutex protecting shared data (device lists, bandwidth stats, blocklists)
+// accessed from both the main loop and the async web server task.
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+extern SemaphoreHandle_t dataMutex;
+
+// --- Performance Metrics ---
+// Loop frequency (loops/second) calculated in main loop, read by web server.
+extern volatile uint32_t loopsPerSecond;
 
 #endif // CONFIG_H
